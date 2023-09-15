@@ -86,10 +86,11 @@ def get_ds_model(
             "stage3_param_persistence_threshold": hidden_size,
             "stage3_max_live_parameters": 2 * hidden_size * hidden_size,
         },
+        "overlap_comm": True,
         "steps_per_print": 1,
         "train_batch_size": args.batch_size,
         "train_micro_batch_size_per_gpu": args.batch_size/args.worlds,
-        "wall_clock_breakdown": False,
+        "wall_clock_breakdown": False
     }
 
     if bits == 4:
@@ -101,20 +102,21 @@ def get_ds_model(
         )
 
     if disk_offload:
+        print(f"pin_memory: {pin_memory} w/ {offload_dir}") # True w/ /dev/nvme0
         ds_config["zero_optimization"]["offload_param"] = dict(
             device="nvme",
-            pin_memory=pin_memory,
-            nvme_path=offload_dir,
-            buffer_count=5,
-            buffer_size=9 * GB if config.model_type == 'bloom' else 2 * GB,
+            pin_memory=True, #pin_memory,
+            nvme_path="dev/nvme0", #offload_dir,
+            buffer_count=7,
+            buffer_size=1e9, #9 * GB if config.model_type == 'bloom' else 2 * GB,
         )
-        ds_config["aio"] = {
+        '''ds_config["aio"] = {
             "block_size": 1048576,
             "queue_depth": 8,
             "thread_count": 1,
             "single_submit": False,
             "overlap_events": True,
-        }
+        }'''
 
     dschf = HfDeepSpeedConfig(
         ds_config
@@ -190,13 +192,15 @@ def run_generation(
         tokenizer = AutoTokenizer.from_pretrained(
             model_name.replace("175b", "66b"), 
             return_token_type_ids=return_token_type_ids,
-            padding_side=padding_side
+            padding_side=padding_side,
+            use_fast=False, 
         )
-    else:
+    else:  # here
         tokenizer = AutoTokenizer.from_pretrained(
             model_name,
             return_token_type_ids=return_token_type_ids,
-            padding_side=padding_side
+            padding_side=padding_side,
+            use_fast=False, 
         )
 
 
@@ -433,6 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--decontamination_ngrams_path", default=None)
     parser.add_argument("--write_out", action="store_true", default=False)
     parser.add_argument("--output_base_path", type=str, default=None)
+    parser.add_argument("--pin_memory", action="store_true", help="Using non_blocking copy for kv cache offloading.")
     #parser.add_argument("--model_args", default="")
 
     args = parser.parse_args()
