@@ -281,7 +281,8 @@ def run_generation(
 
     add_model_hooks(lm.model)
     torch.cuda.set_device(dist.get_rank())
-    timer.start(sync_func=get_accelerator().synchronize)
+    #timer = timers("generate-forward")
+    #timer.start(sync_func=get_accelerator().synchronize)
     results = lm_eval.evaluator.evaluate(
         lm_class=lm,
         lm=lm.model,
@@ -294,7 +295,7 @@ def run_generation(
         write_out=args.write_out,
         output_base_path=args.output_base_path,
     )
-    timer.stop(sync_func=get_accelerator().synchronize)
+    #timer.stop(sync_func=get_accelerator().synchronize)
 
     label_map = None
     print("[lm_eval] is over!!")
