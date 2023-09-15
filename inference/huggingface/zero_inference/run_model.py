@@ -34,6 +34,7 @@ import numpy as np
 import sys
 sys.path.append("./lm_evaluation_harness")
 from lm_evaluation_harness import lm_eval
+from lm_evaluation_harness.lm_eval import models as lm_models
 from lm_evaluation_harness.lm_eval import tasks, evaluator, utils
 from lm_evaluation_harness.lm_eval import evaluator
 
@@ -143,20 +144,22 @@ def get_ds_model(
     else:
         raise ValueError(f"Unexpected model type: {config.model_type}")'''
 
-    lm_eval.evaluator.simple_evaluate(
-        model="hf-causal",
-        pre_trained=model_name,
-    )
-    model = model.eval()
+    _model = "hf-causal"
+    model_args = f"pretrained={model_name}"
+    lm = lm_models.get_model(_model).create_from_arg_string(
+        model_args, {"batch_size": args.batch_size, "max_batch_size": None, "device": "cpu"}
+    ) # class
+    #model = HFLM_class.model
+    #model = model.eval()
 
-    print(f"[BEFORE] model.config = {model.config}") # LlamaForCausalLM
-    ds_engine = deepspeed.initialize(model=model, config_params=ds_config)[0]
+    #print(f"[BEFORE] model.config = {lm.model.config}") # LlamaForCausalLM
+    ds_engine = deepspeed.initialize(model=lm.model, config_params=ds_config)[0]
     ds_engine.module.eval()
-    model = ds_engine.module
+    lm.model = ds_engine.module
     print(f"ds_engine: {ds_engine}") # DeepSpeedEngine()
-    print(f"model.config = {model.config}")
+    print(f"model.config = {lm.model.config}")
 
-    return model
+    return lm, lm.model
 
 
 def run_generation(
@@ -228,7 +231,7 @@ def run_generation(
 
     print("load model")
     with torch.no_grad():
-        model = get_ds_model(
+        lm, model = get_ds_model(
             model_name,
             dtype,
             cpu_offload,
@@ -257,23 +260,8 @@ def run_generation(
     if args.description_dict_path:
         with open(args.description_dict_path, "r") as f:
             description_dict = json.load(f)
-    
-    results = lm_eval.evaluator.evaluate(
-        lm=model,
-        task_dict=task_dict,
-        num_fewshot=args.num_fewshot,
-        limit=args.limit,
-        bootstrap_iters=bootstrap_iters,
-        description_dict=description_dict,
-        decontamination_ngrams_path=args.decontamination_ngrams_path,
-        write_out=args.write_out,
-        output_base_path=args.output_base_path,
-    )
 
-    label_map = None
-    print("[lm_eval] is over!!")
-
-    #prompts = all_eval_text_to_encode
+    '''#prompts = all_eval_text_to_encode
     prompts = ["Paris is the capital city of"] * (batch_size // dist.get_world_size())
 
     def _batch_encode(prompts, return_token_type_ids):
@@ -288,10 +276,28 @@ def run_generation(
     if kv_offload:
         model.set_kv_cache_offload(True, gen_len, pin_kv_cache, async_kv_offload) # AttributeError: 'LlamaForCausalLM' object has no attribute 'set_kv_cache_offload'
 
-    #print(model, model.config)
+    #print(model, model.config)'''
 
 
-    add_model_hooks(model)
+    add_model_hooks(lm.model)
+    torch.cuda.set_device(dist.get_rank())
+    timer.start(sync_func=get_accelerator().synchronize)
+    results = lm_eval.evaluator.evaluate(
+        lm_class=lm,
+        lm=lm.model,
+        task_dict=task_dict,
+        num_fewshot=args.num_fewshot,
+        limit=args.limit,
+        bootstrap_iters=bootstrap_iters,
+        description_dict=description_dict,
+        decontamination_ngrams_path=args.decontamination_ngrams_path,
+        write_out=args.write_out,
+        output_base_path=args.output_base_path,
+    )
+    timer.stop(sync_func=get_accelerator().synchronize)
+
+    label_map = None
+    print("[lm_eval] is over!!")
 
     def set_model_stage(model, stage):
         model.stage = stage
