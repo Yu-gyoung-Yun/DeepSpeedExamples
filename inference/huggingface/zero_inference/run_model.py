@@ -24,7 +24,10 @@ from utils import (GB, add_model_hooks, cache_bytes, disable_torch_init,
                    get_filename, get_quant_config, hidden_bytes, meta_to_cpu,
                    model_bytes, write_benchmark_log)
 from packaging import version
-
+from datasets import load_dataset
+from tqdm import tqdm
+import random
+import json
 
 assert version.parse(deepspeed.__version__) >= version.parse("0.10.3"), "ZeRO-Inference with weight quantization and kv cache offloading is available only in DeepSpeed 0.10.3+, please upgrade DeepSpeed"
 
@@ -74,8 +77,9 @@ def get_ds_model(
             "stage3_param_persistence_threshold": hidden_size,
             "stage3_max_live_parameters": 2 * hidden_size * hidden_size,
         },
-        "steps_per_print": 2000,
+        "steps_per_print": 1,
         "train_batch_size": args.batch_size,
+        "train_micro_batch_size_per_gpu": args.batch_size/args.worlds,
         "wall_clock_breakdown": False,
     }
 
@@ -132,6 +136,7 @@ def get_ds_model(
     ds_engine = deepspeed.initialize(model=model, config_params=ds_config)[0]
     ds_engine.module.eval()
     model = ds_engine.module
+    print(f"ds_engine: {ds_engine}") # DeepSpeedEngine()
     print(f"model.config = {model.config}")
 
     return model
@@ -158,7 +163,7 @@ def run_generation(
 ):
     # Load tokenizer
     config = get_model_config(model_name)
-    return_token_type_ids = True 
+    return_token_type_ids = False # True 
     padding_side = "left" if config.model_type in ["opt"] else "right"
 
     if config.model_type == "opt":
@@ -219,7 +224,58 @@ def run_generation(
 
     # Run generation
     execute_gen_len = gen_len
-    prompts = ["Paris is the capital city of"] * (batch_size // dist.get_world_size())
+    def process_hellaswag_examples(examples):
+        processed_examples = []
+        idx = 0
+        for raw_data in tqdm(examples,desc='process hellaswag examples'):
+            processed_examples.append({
+                'id': idx,
+                'ctx_a': raw_data['ctx_a'],
+                'ctx_b': raw_data['ctx_b'],
+                'ctx':raw_data['ctx'],
+                'endings':raw_data['endings'],
+                'label':int(raw_data['label']),
+                'activity_label':raw_data['activity_label']
+            })
+            idx += 1
+        return processed_examples
+
+    task_name='hellaswag'
+    if os.path.isfile(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) and \
+            os.path.isfile(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')):
+        print('use cached examples')
+        with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) as f:
+            total_train_examples = json.load(f)
+        with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')) as f:
+            total_eval_examples = json.load(f)
+    else:
+        print("[LOAD] dataset")
+        hellaswag_datasets = load_dataset('hellaswag',cache_dir="./cache_dir")
+        total_eval_examples = [e for e in hellaswag_datasets['validation']]
+        # 전체 hellaswag_datasets 10,000 개
+        print(f"[LEN] total_eval_examples: {len(total_eval_examples)}")
+        #total_eval_examples = random.sample(total_eval_examples, 5)
+        total_eval_examples = process_hellaswag_examples(total_eval_examples)
+        with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json'), 'w') as f:
+            json.dump(total_eval_examples, f, indent=4)
+    #if args.debug:
+    #    args.annotation_size = 10
+    #    args.batch_size = 1
+    #    total_train_examples = total_train_examples[:50]
+    #    total_eval_examples = total_eval_examples[:5]
+    #def format_example(example,label_map,**kwargs):
+    #    return f"The topic is {example['activity_label']}. {example['ctx_a']} " \
+    #            f"{example['ctx_b']} ",f"{example['endings'][example['label']]}"
+
+    all_eval_text_to_encode = [f"The topic is {raw_item['activity_label']}. {raw_item['ctx_a']} {raw_item['ctx_b']} | " \
+                                f"{raw_item['endings'][0]} | " \
+                                f"{raw_item['endings'][1]} | " \
+                                f"{raw_item['endings'][2]} | " \
+                                f"{raw_item['endings'][3]}" for raw_item in total_eval_examples]
+    label_map = None
+
+    prompts = all_eval_text_to_encode
+    #prompts = ["Paris is the capital city of"] * (batch_size // dist.get_world_size())
 
     def _batch_encode(prompts, return_token_type_ids):
         input_tokens = tokenizer.batch_encode_plus(prompts, return_tensors="pt", padding="max_length", max_length=prompt_len, return_token_type_ids=return_token_type_ids)
@@ -231,7 +287,7 @@ def run_generation(
     input_tokens = _batch_encode(prompts, return_token_type_ids)
 
     if kv_offload:
-        model.set_kv_cache_offload(True, gen_len, pin_kv_cache, async_kv_offload)
+        model.set_kv_cache_offload(True, gen_len, pin_kv_cache, async_kv_offload) # AttributeError: 'LlamaForCausalLM' object has no attribute 'set_kv_cache_offload'
 
     # print(model, model.config)
 
@@ -252,7 +308,7 @@ def run_generation(
         with torch.no_grad():
             set_model_stage(model, "prefill")
             # output_ids = model.generate(input_ids=input_ids, **generate_kwargs)
-            output_ids = model.generate(**input_tokens, **generate_kwargs)
+            output_ids = model(**input_tokens, **generate_kwargs) # .generate(**input_tokens, **generate_kwargs)
             prefill_timings.append(model.__duration__)
         timer.stop(sync_func=get_accelerator().synchronize)
     costs = timers("generate-forward").costs
@@ -289,6 +345,7 @@ def run_generation(
 
     if verbose >= 2:
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        print(f"outputs: {len(outputs)}")
         show_str = "Outputs:\n" + 70 * "-" + "\n"
         for i in [0, (len(outputs) - 1) // 2, len(outputs) - 1]:
             show_str += f"{i}: {outputs[i]}\n"
@@ -358,6 +415,9 @@ if __name__ == "__main__":
     parser.add_argument("--quant_group_size", type=int, default=64, help="model weight quantization group size")
     parser.add_argument("--pin_kv_cache", action="store_true", help="Allocate kv cache in pinned memory for offloading.")
     parser.add_argument("--async_kv_offload", action="store_true", help="Using non_blocking copy for kv cache offloading.")
+    parser.add_argument("--output_dir", type=str, default="./data", help="enable hybrid engine testing")
+    parser.add_argument("--seed", type=int, default=42, help="enable hybrid engine testing")
+    parser.add_argument("--worlds", type=int, default=2, help="number of total gpus in program")
     args = parser.parse_args()
 
     deepspeed.init_distributed()    
