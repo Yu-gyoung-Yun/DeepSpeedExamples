@@ -16,5 +16,7 @@ parser.add_argument("--greedy", action='store_true', help="greedy generation mod
 parser.add_argument("--use_meta_tensor", action='store_true', help="use the meta tensors to initialize model")
 parser.add_argument("--test_performance", action='store_true', help="enable latency, bandwidth, and throughout testing")
 parser.add_argument("--local_rank", type=int, default=int(os.getenv("LOCAL_RANK", "0")), help="local rank")
-parser.add_argument("--world_size", type=int, default=int(os.getenv("WORLD_SIZE", "1")), help="world_size")
+parser.add_argument("--world_size", type=int, default=int(os.getenv("WORLD_SIZE", "4")), help="world_size")
 parser.add_argument("--test_hybrid_engine", action='store_true', help="enable hybrid engine testing")
+parser.add_argument("--output_dir", type=str, default="./data", help="enable hybrid engine testing")
+parser.add_argument("--seed", type=int, default=42, help="enable hybrid engine testing")
